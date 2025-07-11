@@ -1,0 +1,32 @@
+{
+  "labelstudio_export_path": "label-studio-export/data-v1/manifest.jsonl",
+  "audio_base_path": "label-studio-export/data-v1",
+  "model_name": "openai/whisper-small",
+  "target_language": "sw",
+  "task": "transcribe",
+  "learning_rate": 1e-05,
+  "per_device_train_batch_size": 2,
+  "per_device_eval_batch_size": 2,
+  "gradient_accumulation_steps": 2,
+  "max_steps": 1000,
+  "warmup_steps": 500,
+  "eval_steps": 100,
+  "save_steps": 100,
+  "logging_steps": 25,
+  "fp16": false,
+  "bf16": true,
+  "gradient_checkpointing": true,
+  "gradient_checkpointing_kwargs": {
+    "use_reentrant": false
+  },
+  "dataloader_pin_memory": false,
+  "dataloader_num_workers": 0,
+  "test_size": 0.2,
+  "max_eval_samples": 10,
+  "mlflow_tracking_uri": "http://localhost:5000",
+  "mlflow_experiment_name": "whisper-production-training",
+  "output_dir": "./whisper-finetuned-production",
+  "registered_model_name": "whisper-finetuned-swahili",
+  "max_grad_norm": 1.0,
+  "optim": "adamw_torch"
+}
