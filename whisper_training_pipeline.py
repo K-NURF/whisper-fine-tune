@@ -8,6 +8,8 @@ import os
 import json
 import logging
 import argparse
+import sys
+import time
 import pandas as pd
 import numpy as np
 import torch
@@ -61,10 +63,21 @@ import evaluate
 import mlflow
 import mlflow.pytorch
 
-# Configure logging
+# Add flush=True to all print statements for immediate output
+def progress_print(message, level="INFO"):
+    """Print with immediate flush for real-time progress"""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}", flush=True)
+    logger.info(message)
+
+# Enhanced logging configuration
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training_progress.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -74,65 +87,246 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 
 class WhisperTrainingConfig:
-    """Configuration class for Whisper training pipeline"""
+    """Configuration class for Whisper training pipeline - fully config-driven"""
     
-    def __init__(self, config_path: Optional[str] = None):
+    # Define required parameters with no defaults
+    REQUIRED_PARAMS = {
         # Data paths
-        self.labelstudio_export_path = "label-studio-export/data-v1/manifest.jsonl"
-        self.audio_base_path = "label-studio-export/data-v1"
+        'labelstudio_export_path': str,
+        'audio_base_path': str,
         
         # Model configuration
-        self.model_name = "openai/whisper-small"
-        self.target_language = "sw"  # Swahili
-        self.task = "transcribe"
+        'model_name': str,
+        'target_language': str,
+        'task': str,
         
         # Training configuration
-        self.learning_rate = 1e-5
-        self.per_device_train_batch_size = 2
-        self.per_device_eval_batch_size = 2
-        self.gradient_accumulation_steps = 2
-        self.max_steps = 1000
-        self.warmup_steps = 500
-        self.eval_steps = 100
-        self.save_steps = 100
-        self.logging_steps = 25
+        'learning_rate': float,
+        'per_device_train_batch_size': int,
+        'per_device_eval_batch_size': int,
+        'gradient_accumulation_steps': int,
+        'max_steps': int,
+        'warmup_steps': int,
+        'eval_steps': int,
+        'save_steps': int,
+        'logging_steps': int,
         
-        # Memory optimization - FIXED FP16 ISSUES
-        self.fp16 = False  # Disable FP16 to avoid gradient unscaling issues
-        self.bf16 = True   # Use BF16 instead if available
-        self.gradient_checkpointing = True
-        self.gradient_checkpointing_kwargs = {"use_reentrant": False}  # Fixed!
-        self.dataloader_pin_memory = False
-        self.dataloader_num_workers = 0
+        # Memory optimization
+        'fp16': bool,
+        'bf16': bool,
+        'gradient_checkpointing': bool,
+        'dataloader_pin_memory': bool,
+        'dataloader_num_workers': int,
         
         # Evaluation
-        self.test_size = 0.2
-        self.max_eval_samples = 10
+        'test_size': float,
+        'max_eval_samples': int,
         
         # MLflow
-        self.mlflow_tracking_uri = "http://localhost:5000"
-        self.mlflow_experiment_name = "whisper-production-training"
+        'mlflow_tracking_uri': str,
+        'mlflow_experiment_name': str,
         
         # Output
-        self.output_dir = "./whisper-finetuned-production"
-        self.registered_model_name = "whisper-finetuned-swahili"
-        
-        # Load from config file if provided
-        if config_path and os.path.exists(config_path):
-            self.load_from_file(config_path)
+        'output_dir': str,
+        'registered_model_name': str,
+    }
     
-    def load_from_file(self, config_path: str):
-        """Load configuration from JSON file"""
+    # Optional parameters with validation
+    OPTIONAL_PARAMS = {
+        'gradient_checkpointing_kwargs': dict,
+        'max_grad_norm': float,
+        'optim': str,
+        'num_train_epochs': int,  # Alternative to max_steps
+        'early_stopping_patience': int,
+        'early_stopping_threshold': float,
+        'generation_max_length': int,
+        'target_sample_rate': int,
+        'max_audio_duration': float,
+        'min_audio_duration': float,
+        'max_transcription_length': int,
+        'min_transcription_length': int,
+    }
+    
+    def __init__(self, config_path: str):
+        """Initialize configuration from JSON file - no defaults allowed for required params"""
+        if not config_path:
+            raise ValueError("Config path is required")
+        
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        # Load configuration
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
-        for key, value in config_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+        
+        # Validate and set required parameters
+        self._validate_and_set_required_params(config_dict)
+        
+        # Set optional parameters with validation
+        self._validate_and_set_optional_params(config_dict)
+        
+        # Validate configuration consistency
+        self._validate_configuration()
+        
+        logger.info(f"Configuration loaded successfully from {config_path}")
+        self._log_configuration_summary()
+    
+    def _validate_and_set_required_params(self, config_dict: dict):
+        """Validate and set all required parameters"""
+        missing_params = []
+        
+        for param_name, param_type in self.REQUIRED_PARAMS.items():
+            if param_name not in config_dict:
+                missing_params.append(param_name)
+            else:
+                value = config_dict[param_name]
+                
+                # Type validation
+                if not isinstance(value, param_type):
+                    raise TypeError(f"Parameter '{param_name}' must be of type {param_type.__name__}, got {type(value).__name__}")
+                
+                setattr(self, param_name, value)
+        
+        if missing_params:
+            raise ValueError(f"Missing required configuration parameters: {missing_params}")
+    
+    def _validate_and_set_optional_params(self, config_dict: dict):
+        """Validate and set optional parameters"""
+        # Set defaults for optional parameters
+        optional_defaults = {
+            'gradient_checkpointing_kwargs': {"use_reentrant": False},
+            'max_grad_norm': 1.0,
+            'optim': "adamw_torch",
+            'num_train_epochs': None,  # Use max_steps by default
+            'early_stopping_patience': 3,
+            'early_stopping_threshold': 0.01,
+            'generation_max_length': 225,
+            'target_sample_rate': 16000,
+            'max_audio_duration': 60.0,
+            'min_audio_duration': 0.1,
+            'max_transcription_length': 1000,
+            'min_transcription_length': 3,
+        }
+        
+        for param_name, default_value in optional_defaults.items():
+            if param_name in config_dict:
+                value = config_dict[param_name]
+                expected_type = self.OPTIONAL_PARAMS[param_name]
+                
+                # Type validation for optional params
+                if not isinstance(value, expected_type):
+                    raise TypeError(f"Optional parameter '{param_name}' must be of type {expected_type.__name__}, got {type(value).__name__}")
+                
+                setattr(self, param_name, value)
+            else:
+                setattr(self, param_name, default_value)
+    
+    def _validate_configuration(self):
+        """Validate configuration consistency and constraints"""
+        errors = []
+        
+        # Validate ranges and constraints
+        if not (0 < self.learning_rate < 1):
+            errors.append(f"learning_rate must be between 0 and 1, got {self.learning_rate}")
+        
+        if not (0 < self.test_size < 1):
+            errors.append(f"test_size must be between 0 and 1, got {self.test_size}")
+        
+        if self.per_device_train_batch_size <= 0:
+            errors.append(f"per_device_train_batch_size must be positive, got {self.per_device_train_batch_size}")
+        
+        if self.gradient_accumulation_steps <= 0:
+            errors.append(f"gradient_accumulation_steps must be positive, got {self.gradient_accumulation_steps}")
+        
+        if self.max_steps <= 0 and (not hasattr(self, 'num_train_epochs') or self.num_train_epochs is None):
+            errors.append("Either max_steps must be positive or num_train_epochs must be specified")
+        
+        if self.warmup_steps < 0:
+            errors.append(f"warmup_steps must be non-negative, got {self.warmup_steps}")
+        
+        # Validate task and language
+        valid_tasks = ["transcribe", "translate"]
+        if self.task not in valid_tasks:
+            errors.append(f"task must be one of {valid_tasks}, got '{self.task}'")
+        
+        # Validate model name format
+        if "/" not in self.model_name:
+            errors.append(f"model_name should be in format 'organization/model', got '{self.model_name}'")
+        
+        # Validate paths exist
+        if not os.path.exists(self.labelstudio_export_path):
+            errors.append(f"labelstudio_export_path does not exist: {self.labelstudio_export_path}")
+        
+        if not os.path.exists(self.audio_base_path):
+            errors.append(f"audio_base_path does not exist: {self.audio_base_path}")
+        
+        # Validate MLflow URI format
+        if not self.mlflow_tracking_uri.startswith(("http://", "https://", "file://", "sqlite:///")):
+            errors.append(f"mlflow_tracking_uri must be a valid URI, got '{self.mlflow_tracking_uri}'")
+        
+        # Validate precision settings
+        if self.fp16 and self.bf16:
+            errors.append("Cannot enable both fp16 and bf16 simultaneously")
+        
+        # Validate audio duration constraints
+        if self.min_audio_duration >= self.max_audio_duration:
+            errors.append(f"min_audio_duration ({self.min_audio_duration}) must be less than max_audio_duration ({self.max_audio_duration})")
+        
+        # Validate transcription length constraints
+        if self.min_transcription_length >= self.max_transcription_length:
+            errors.append(f"min_transcription_length ({self.min_transcription_length}) must be less than max_transcription_length ({self.max_transcription_length})")
+        
+        if errors:
+            raise ValueError(f"Configuration validation failed:\n" + "\n".join(f"  - {error}" for error in errors))
+    
+    def _log_configuration_summary(self):
+        """Log a summary of the configuration"""
+        logger.info("Configuration Summary:")
+        logger.info(f"  Model: {self.model_name}")
+        logger.info(f"  Language: {self.target_language} | Task: {self.task}")
+        logger.info(f"  Training: {self.max_steps} steps, LR: {self.learning_rate}")
+        logger.info(f"  Batch: {self.per_device_train_batch_size} x {self.gradient_accumulation_steps} accumulation")
+        logger.info(f"  Precision: FP16={self.fp16}, BF16={self.bf16}")
+        logger.info(f"  Data: {self.labelstudio_export_path}")
+        logger.info(f"  Output: {self.output_dir}")
+        logger.info(f"  MLflow: {self.mlflow_tracking_uri} | Experiment: {self.mlflow_experiment_name}")
     
     def to_dict(self) -> Dict:
         """Convert config to dictionary for MLflow logging"""
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
+        config_dict = {}
+        
+        # Add all required parameters
+        for param_name in self.REQUIRED_PARAMS.keys():
+            config_dict[param_name] = getattr(self, param_name)
+        
+        # Add all optional parameters that were set
+        for param_name in self.OPTIONAL_PARAMS.keys():
+            if hasattr(self, param_name):
+                config_dict[param_name] = getattr(self, param_name)
+        
+        return config_dict
+    
+    def get_effective_batch_size(self) -> int:
+        """Calculate effective batch size"""
+        return self.per_device_train_batch_size * self.gradient_accumulation_steps
+    
+    def validate_data_paths(self):
+        """Validate that all data paths are accessible"""
+        # Check Label Studio export
+        if not os.path.exists(self.labelstudio_export_path):
+            raise FileNotFoundError(f"Label Studio export not found: {self.labelstudio_export_path}")
+        
+        # Check audio base path
+        if not os.path.exists(self.audio_base_path):
+            raise FileNotFoundError(f"Audio base path not found: {self.audio_base_path}")
+        
+        # Check if audio directory exists within base path
+        audio_dir = os.path.join(self.audio_base_path, 'audio')
+        if not os.path.exists(audio_dir):
+            logger.warning(f"Audio subdirectory not found: {audio_dir}")
+            # Don't raise error here as audio files might be in base path directly
+        
+        return True
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -149,14 +343,30 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         label_features = [{"input_ids": feature["labels"]} for feature in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
-        # Replace padding with -100 to ignore loss correctly
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        # Create proper attention mask
+        labels = labels_batch["input_ids"]
+        attention_mask = labels_batch.get("attention_mask")
+        
+        if attention_mask is not None:
+            # Use the attention mask from tokenizer
+            labels = labels.masked_fill(attention_mask.ne(1), -100)
+        else:
+            # Fallback: create attention mask manually
+            # Replace padding tokens with -100 to ignore in loss
+            labels = labels.masked_fill(labels == self.processor.tokenizer.pad_token_id, -100)
 
         # Cut bos token if appended
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, 1:]
 
         batch["labels"] = labels
+        
+        # Add attention mask to batch if available
+        if attention_mask is not None:
+            batch["attention_mask"] = attention_mask
+            
         return batch
 
 
@@ -167,20 +377,31 @@ class MLflowIntegrationCallback(TrainerCallback):
         self.config = config
         self.baseline_wer = baseline_wer
         self.run_id = None
+        self.logged_params = set()
     
     def on_train_begin(self, args, state, control, **kwargs):
         """Initialize MLflow run"""
         try:
             # End any existing runs
             if mlflow.active_run():
+                logger.info("Ending existing MLflow run to start a new one")
                 mlflow.end_run()
             
             # Start new run
             run = mlflow.start_run(run_name=f"whisper-training-{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
             self.run_id = run.info.run_id
             
-            # Log configuration
-            mlflow.log_params(self.config.to_dict())
+            # Log configuration parameters (avoid conflicts)
+            config_params = self.config.to_dict()
+            for key, value in config_params.items():
+                try:
+                    if key not in self.logged_params:
+                        mlflow.log_param(key, value)
+                        self.logged_params.add(key)
+                except Exception as e:
+                    logger.warning(f"Failed to log param {key}: {e}")
+            
+
             
             # Log training arguments
             training_params = {
@@ -189,7 +410,14 @@ class MLflowIntegrationCallback(TrainerCallback):
                 "num_train_epochs": args.num_train_epochs,
                 "max_steps": args.max_steps,
             }
-            mlflow.log_params(training_params)
+            # Only log parameters that haven't been logged yet
+            for key, value in training_params.items():
+                try:
+                    if key not in self.logged_params:
+                        mlflow.log_param(key, value)
+                        self.logged_params.add(key)
+                except Exception as e:
+                    logger.warning(f"Failed to log training param {key}: {e}")
             
             if self.baseline_wer is not None:
                 mlflow.log_metric("baseline_wer", self.baseline_wer * 100)
@@ -234,7 +462,7 @@ class MLflowIntegrationCallback(TrainerCallback):
 
 
 class WhisperDataLoader:
-    """Handles data loading and preprocessing"""
+    """Handles data loading and preprocessing - fully config-driven"""
     
     def __init__(self, config: WhisperTrainingConfig):
         self.config = config
@@ -256,7 +484,8 @@ class WhisperDataLoader:
                     if audio_path and transcription:
                         transcription = transcription.strip()
                         
-                        if 3 <= len(transcription) <= 1000:
+                        # Use config values instead of hardcoded values
+                        if (self.config.min_transcription_length <= len(transcription) <= self.config.max_transcription_length):
                             processed_data.append({
                                 'audio_path': audio_path,
                                 'transcription': transcription,
@@ -270,8 +499,8 @@ class WhisperDataLoader:
         logger.info(f"Loaded {len(processed_data)} valid samples")
         return processed_data
     
-    def load_and_validate_audio(self, audio_path: str, target_sr: int = 16000) -> Tuple[Optional[np.ndarray], Optional[int], str]:
-        """Load and validate audio file"""
+    def load_and_validate_audio(self, audio_path: str) -> Tuple[Optional[np.ndarray], Optional[int], str]:
+        """Load and validate audio file using config parameters"""
         try:
             if not os.path.isabs(audio_path):
                 audio_path = os.path.join(self.config.audio_base_path, audio_path)
@@ -288,15 +517,17 @@ class WhisperDataLoader:
             if len(audio.shape) > 1:
                 audio = np.mean(audio, axis=1)
             
-            if sr != target_sr:
-                return None, None, f"Unexpected sample rate {sr}Hz (expected {target_sr}Hz)"
+            # Use config target sample rate instead of hardcoded 16000
+            if sr != self.config.target_sample_rate:
+                return None, None, f"Unexpected sample rate {sr}Hz (expected {self.config.target_sample_rate}Hz)"
             
             if audio is None or len(audio) == 0:
                 return None, None, f"Empty audio data"
             
             duration = len(audio) / sr
-            if duration < 0.1 or duration > 60:
-                return None, None, f"Unexpected duration ({duration:.2f}s)"
+            # Use config duration constraints instead of hardcoded values
+            if duration < self.config.min_audio_duration or duration > self.config.max_audio_duration:
+                return None, None, f"Duration {duration:.2f}s outside range [{self.config.min_audio_duration}, {self.config.max_audio_duration}]"
             
             return audio, sr, "OK"
             
@@ -340,7 +571,7 @@ class WhisperDataLoader:
 
 
 class WhisperTrainingPipeline:
-    """Main training pipeline"""
+    """Main training pipeline - fully config-driven"""
     
     def __init__(self, config: WhisperTrainingConfig):
         self.config = config
@@ -348,6 +579,9 @@ class WhisperTrainingPipeline:
         self.model = None
         self.trainer = None
         self.wer_metric = evaluate.load("wer")
+        
+        # Validate configuration and data paths
+        self.config.validate_data_paths()
         
         # Setup MLflow
         self._setup_mlflow()
@@ -372,57 +606,63 @@ class WhisperTrainingPipeline:
         logger.info("GPU memory cleared")
     
     def load_model_and_processor(self):
-        """Load Whisper model and processor with proper error handling"""
+        """Load Whisper model and processor using config model_name"""
         logger.info(f"Loading model: {self.config.model_name}")
         
         try:
-            # Load processor
+            # Load processor - use config model name, not hardcoded
             self.processor = WhisperProcessor.from_pretrained(self.config.model_name)
             
             # Load model with appropriate dtype
             model_kwargs = {}
             if torch.cuda.is_available():
-                model_kwargs['torch_dtype'] = torch.float16 if self.config.fp16 else torch.float32
+                # Use config precision settings instead of hardcoded
+                if self.config.fp16:
+                    model_kwargs['torch_dtype'] = torch.float16
+                elif self.config.bf16:
+                    model_kwargs['torch_dtype'] = torch.bfloat16
+                else:
+                    model_kwargs['torch_dtype'] = torch.float32
             
             self.model = WhisperForConditionalGeneration.from_pretrained(
-                self.config.model_name, 
+                self.config.model_name,  # Use config model name
                 **model_kwargs
             )
             
             # Configure model for training
             self.model.config.forced_decoder_ids = None
             self.model.config.suppress_tokens = []
-            self.model.config.use_cache = False  # Important for gradient checkpointing
+            self.model.config.use_cache = False
             
             # Move to GPU
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model = self.model.to(device)
             
-            logger.info(f"Model loaded successfully on {device}")
+            logger.info(f"Model {self.config.model_name} loaded successfully on {device}")
             
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Failed to load model {self.config.model_name}: {e}")
             raise
     
     def prepare_dataset(self, samples: List[Dict]) -> DatasetDict:
-        """Convert samples to HuggingFace dataset format"""
+        """Convert samples to HuggingFace dataset format using config parameters"""
         logger.info("Preparing dataset...")
         
         def process_sample(sample):
-            # Process audio to log-mel spectrogram
+            # Process audio to log-mel spectrogram using config sample rate
             input_features = self.processor.feature_extractor(
                 sample['audio'], 
-                sampling_rate=16000, 
+                sampling_rate=self.config.target_sample_rate,  # Use config value
                 return_tensors="pt"
             ).input_features[0]
             
-            # Tokenize transcription
+            # Tokenize transcription using config max length
             labels = self.processor.tokenizer(
                 sample['transcription'], 
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True,
-                max_length=448
+                max_length=self.config.generation_max_length * 2  # Use config-based length
             ).input_ids[0]
             
             return {
@@ -517,10 +757,12 @@ class WhisperTrainingPipeline:
             wer = 1.0  # Return high WER if computation fails
 
         return {"wer": wer}
-    
-    def evaluate_baseline(self, test_samples: List[Dict], max_samples: int = 10) -> Optional[float]:
-        """Evaluate baseline model performance"""
+    def evaluate_baseline(self, test_samples: List[Dict]) -> Optional[float]:
+        """Evaluate baseline model performance using config parameters"""
         logger.info("Evaluating baseline model...")
+        
+        # Use config max_eval_samples instead of hardcoded value
+        max_samples = min(len(test_samples), self.config.max_eval_samples)
         
         predictions = []
         references = []
@@ -531,31 +773,24 @@ class WhisperTrainingPipeline:
         with torch.no_grad():
             for i, sample in enumerate(test_samples[:max_samples]):
                 try:
-                    # Process audio
+                    # Process audio using config sample rate
                     input_features = self.processor(
                         sample['audio'], 
-                        sampling_rate=16000, 
+                        sampling_rate=self.config.target_sample_rate,  # Use config value
                         return_tensors="pt"
                     ).input_features.to(device)
                     
-                    # Generate transcription with safer parameters
+                    # Generate transcription with config parameters
                     try:
-                        forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                            language=self.config.target_language, 
-                            task=self.config.task
-                        )
+                        generation_kwargs = {
+                            "max_length": self.config.generation_max_length,
+                            "num_beams": 1,
+                            "do_sample": False,
+                            "language": self.config.target_language,  # Use these instead
+                            "task": self.config.task                  # of forced_decoder_ids
+                        }
                     except Exception:
-                        # Fallback if get_decoder_prompt_ids fails
-                        forced_decoder_ids = None
-                    
-                    generation_kwargs = {
-                        "max_length": 225,
-                        "num_beams": 1,  # Use greedy decoding for baseline
-                        "do_sample": False
-                    }
-                    
-                    if forced_decoder_ids is not None:
-                        generation_kwargs["forced_decoder_ids"] = forced_decoder_ids
+                        generation_kwargs = None
                     
                     predicted_ids = self.model.generate(
                         input_features,
@@ -576,8 +811,9 @@ class WhisperTrainingPipeline:
                 baseline_wer = self.wer_metric.compute(predictions=predictions, references=references)
                 logger.info(f"Baseline WER: {baseline_wer:.4f}")
                 
-                # Log sample predictions
-                for i in range(min(3, len(predictions))):
+                # Log sample predictions (limit based on config)
+                sample_count = min(3, len(predictions))
+                for i in range(sample_count):
                     logger.info(f"Sample {i+1}:")
                     logger.info(f"  Reference: {references[i][:100]}...")
                     logger.info(f"  Prediction: {predictions[i][:100]}...")
@@ -591,7 +827,7 @@ class WhisperTrainingPipeline:
             return None
     
     def setup_trainer(self, dataset: DatasetDict, baseline_wer: Optional[float] = None):
-        """Setup the Seq2SeqTrainer"""
+        """Setup the Seq2SeqTrainer using all config parameters"""
         logger.info("Setting up trainer...")
         
         # Data collator
@@ -600,76 +836,70 @@ class WhisperTrainingPipeline:
             decoder_start_token_id=self.model.config.decoder_start_token_id,
         )
         
-        # Training arguments
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=self.config.output_dir,
+        # Training arguments - ALL from config
+        training_args_dict = {
+            "output_dir": self.config.output_dir,
             
-            # Batch configuration
-            per_device_train_batch_size=self.config.per_device_train_batch_size,
-            per_device_eval_batch_size=self.config.per_device_eval_batch_size,
-            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            # Batch configuration from config
+            "per_device_train_batch_size": self.config.per_device_train_batch_size,
+            "per_device_eval_batch_size": self.config.per_device_eval_batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
             
-            # Training configuration
-            learning_rate=self.config.learning_rate,
-            warmup_steps=self.config.warmup_steps,
-            max_steps=self.config.max_steps,
+            # Training configuration from config
+            "learning_rate": self.config.learning_rate,
+            "warmup_steps": self.config.warmup_steps,
+            "max_steps": self.config.max_steps,
             
-            # Memory optimization - FIXED FP16 ISSUES
-            gradient_checkpointing=self.config.gradient_checkpointing,
-            fp16=False,  # Disable FP16 to avoid gradient unscaling errors
-            bf16=True,   # Use BF16 instead (better compatibility)
+            # Memory optimization from config
+            "gradient_checkpointing": self.config.gradient_checkpointing,
+            "fp16": self.config.fp16,
+            "bf16": self.config.bf16,
             
-            # Evaluation
-            eval_strategy="steps",
-            eval_steps=self.config.eval_steps,
-            generation_max_length=225,
+            # Evaluation from config
+            "eval_strategy": "steps",
+            "eval_steps": self.config.eval_steps,
+            "generation_max_length": self.config.generation_max_length,
             
-            # Saving and logging
-            save_steps=self.config.save_steps,
-            logging_steps=self.config.logging_steps,
-            save_total_limit=3,
-            load_best_model_at_end=True,
-            metric_for_best_model="wer",
-            greater_is_better=False,
+            # Saving and logging from config
+            "save_steps": self.config.save_steps,
+            "logging_steps": self.config.logging_steps,
+            "save_total_limit": 3,
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "wer",
+            "greater_is_better": False,
             
-            # Disable automatic MLflow reporting (we use custom callback)
-            report_to=[],
+            # Disable automatic MLflow reporting
+            "report_to": [],
             
-            # Memory optimization
-            dataloader_pin_memory=self.config.dataloader_pin_memory,
-            dataloader_num_workers=self.config.dataloader_num_workers,
+            # Memory optimization from config
+            "dataloader_pin_memory": self.config.dataloader_pin_memory,
+            "dataloader_num_workers": self.config.dataloader_num_workers,
             
-            # Remove problematic settings for compatibility
-            remove_unused_columns=False,  # Important for speech tasks
+            "remove_unused_columns": False,
             
-            # Additional stability settings
-            max_grad_norm=1.0,  # Gradient clipping
-            optim="adamw_torch",  # Use torch AdamW optimizer
-        )
+            # Additional settings from config
+            "max_grad_norm": self.config.max_grad_norm,
+            "optim": self.config.optim,
+        }
         
-        # Add gradient checkpointing kwargs only if supported
-        try:
-            if hasattr(training_args, 'gradient_checkpointing_kwargs'):
-                training_args.gradient_checkpointing_kwargs = self.config.gradient_checkpointing_kwargs
-        except Exception:
-            pass  # Ignore if not supported in this version
+        # Add num_train_epochs if specified in config (alternative to max_steps)
+        if hasattr(self.config, 'num_train_epochs') and self.config.num_train_epochs is not None:
+            training_args_dict["num_train_epochs"] = self.config.num_train_epochs
+            del training_args_dict["max_steps"]  # Remove max_steps if using epochs
         
-        # Auto-detect and set appropriate precision
-        if torch.cuda.is_available():
-            # Check if BF16 is supported (Ampere GPUs and newer)
+        training_args = Seq2SeqTrainingArguments(**training_args_dict)
+        
+        # Add gradient checkpointing kwargs from config if supported
+        if hasattr(self.config, 'gradient_checkpointing_kwargs') and hasattr(training_args, 'gradient_checkpointing_kwargs'):
+            training_args.gradient_checkpointing_kwargs = self.config.gradient_checkpointing_kwargs
+        
+        # Auto-detect precision if not explicitly set
+        if torch.cuda.is_available() and not (self.config.fp16 or self.config.bf16):
             if torch.cuda.get_device_capability()[0] >= 8:
                 training_args.bf16 = True
-                training_args.fp16 = False
-                logger.info("Using BF16 precision (Ampere GPU detected)")
+                logger.info("Auto-enabled BF16 precision (Ampere GPU detected)")
             else:
-                # Fallback to FP32 for older GPUs to avoid gradient unscaling issues
-                training_args.bf16 = False
-                training_args.fp16 = False
-                logger.info("Using FP32 precision (older GPU or FP16 compatibility issues)")
-        else:
-            training_args.bf16 = False
-            training_args.fp16 = False
-            logger.info("Using FP32 precision (CPU training)")
+                logger.info("Using FP32 precision (older GPU detected)")
         
         # Initialize trainer
         trainer_kwargs = {
@@ -681,15 +911,14 @@ class WhisperTrainingPipeline:
             "compute_metrics": self.compute_metrics,
         }
         
-        # Add processing_class only if supported
+        # Add processing_class/tokenizer with version compatibility
         try:
             trainer_kwargs["processing_class"] = self.processor
         except Exception:
-            # Fallback for older versions that use tokenizer
             try:
                 trainer_kwargs["tokenizer"] = self.processor.tokenizer
             except Exception:
-                pass  # Some versions don't need this
+                pass
         
         self.trainer = Seq2SeqTrainer(**trainer_kwargs)
         
@@ -697,13 +926,14 @@ class WhisperTrainingPipeline:
         mlflow_callback = MLflowIntegrationCallback(self.config, baseline_wer)
         self.trainer.add_callback(mlflow_callback)
         
-        # Add early stopping (only if callback class is available)
+        # Add early stopping using config parameters
         try:
             early_stopping = EarlyStoppingCallback(
-                early_stopping_patience=3,
-                early_stopping_threshold=0.01
+                early_stopping_patience=self.config.early_stopping_patience,
+                early_stopping_threshold=self.config.early_stopping_threshold
             )
             self.trainer.add_callback(early_stopping)
+            logger.info(f"Early stopping enabled: patience={self.config.early_stopping_patience}, threshold={self.config.early_stopping_threshold}")
         except Exception:
             logger.info("Early stopping callback not available in this version")
         
@@ -731,7 +961,7 @@ class WhisperTrainingPipeline:
             self._clear_gpu_memory()
     
     def evaluate_and_save_model(self) -> Dict:
-        """Final evaluation and model saving"""
+        """Enhanced model saving with better MLflow integration"""
         logger.info("Final evaluation...")
         
         try:
@@ -741,52 +971,88 @@ class WhisperTrainingPipeline:
             
             logger.info(f"Final evaluation results: {eval_results}")
             
-            # Save model locally
+            # Save model locally first (always works)
+            progress_print("💾 Saving model locally...")
             self.trainer.save_model()
-            logger.info(f"Model saved to {self.config.output_dir}")
+            progress_print(f"✅ Model saved locally to {self.config.output_dir}")
             
-            # Log to MLflow if active run
+            # Also save processor
+            self.processor.save_pretrained(self.config.output_dir)
+            progress_print("✅ Processor saved locally")
+            
+            # MLflow logging with better error handling
             if mlflow.active_run():
                 try:
-                    # Log final metrics
+                    # Log final metrics first (these usually work)
+                    progress_print("📊 Logging final metrics to MLflow...")
                     for key, value in eval_results.items():
                         if isinstance(value, (int, float)):
                             mlflow.log_metric(f"final_{key}", value)
                     
-                    # Save model to MLflow
-                    model_to_save = self.trainer.model
-                    if hasattr(self.trainer, 'accelerator'):
-                        try:
-                            model_to_save = self.trainer.accelerator.unwrap_model(self.trainer.model)
-                        except Exception:
-                            pass  # Use original model if unwrapping fails
+                    # Try multiple model logging approaches
+                    progress_print("🔄 Attempting MLflow model upload...")
+                    model_logged = False
                     
-                    # Simple model logging without signature for compatibility
+                    # Method 1: Try standard pytorch logging
                     try:
+                        model_to_save = self.trainer.model
+                        if hasattr(self.trainer, 'accelerator'):
+                            try:
+                                model_to_save = self.trainer.accelerator.unwrap_model(self.trainer.model)
+                            except:
+                                pass
+                        
+                        # Use updated MLflow API
                         mlflow.pytorch.log_model(
                             pytorch_model=model_to_save,
                             artifact_path="model",
-                            registered_model_name=self.config.registered_model_name
+                            registered_model_name=self.config.registered_model_name,
+                            await_registration_for=300,  # Wait up to 5 minutes
                         )
-                        logger.info("Model logged to MLflow successfully")
+                        progress_print("✅ Model uploaded to MLflow successfully (Method 1)")
+                        model_logged = True
+                        
                     except Exception as e:
-                        logger.warning(f"MLflow model logging failed: {e}")
-                        # Try alternative approach
+                        progress_print(f"⚠️  Method 1 failed: {e}", "WARNING")
+                    
+                    # Method 2: Log as artifacts if pytorch logging fails
+                    if not model_logged:
                         try:
-                            import tempfile
-                            import os
+                            progress_print("🔄 Trying alternative upload method...")
                             
-                            with tempfile.TemporaryDirectory() as temp_dir:
-                                model_path = os.path.join(temp_dir, "model")
-                                model_to_save.save_pretrained(model_path)
-                                self.processor.save_pretrained(model_path)
-                                mlflow.log_artifacts(model_path, artifact_path="model_files")
-                                logger.info("Model files logged to MLflow as artifacts")
+                            # Log model files as artifacts
+                            mlflow.log_artifacts(self.config.output_dir, artifact_path="model_files")
+                            
+                            # Create a simple model info file
+                            model_info = {
+                                "model_name": self.config.model_name,
+                                "model_path": self.config.output_dir,
+                                "final_wer": final_wer,
+                                "model_type": "whisper_finetuned",
+                                "loading_instructions": f"Use: model = WhisperForConditionalGeneration.from_pretrained('{self.config.output_dir}')"
+                            }
+                            
+                            mlflow.log_dict(model_info, "model_info.json")
+                            progress_print("✅ Model files uploaded as artifacts (Method 2)")
+                            model_logged = True
+                            
                         except Exception as e2:
-                            logger.warning(f"Alternative model logging also failed: {e2}")
+                            progress_print(f"⚠️  Method 2 also failed: {e2}", "WARNING")
+                    
+                    # Method 3: At least log the model path
+                    if not model_logged:
+                        try:
+                            mlflow.log_param("model_save_path", self.config.output_dir)
+                            mlflow.log_param("manual_loading_required", True)
+                            progress_print("⚠️  Model upload failed, but path logged", "WARNING")
+                        except Exception as e3:
+                            progress_print(f"⚠️  All upload methods failed: {e3}", "WARNING")
+                    
+                    progress_print("📈 MLflow logging completed")
                     
                 except Exception as e:
-                    logger.warning(f"MLflow model logging failed: {e}")
+                    progress_print(f"⚠️  MLflow logging failed: {e}", "WARNING")
+                    progress_print("💡 Model is still saved locally and can be used")
             
             return eval_results
             
@@ -794,13 +1060,12 @@ class WhisperTrainingPipeline:
             logger.error(f"Final evaluation failed: {e}")
             raise
         finally:
-            # End MLflow run
             try:
                 if mlflow.active_run():
                     mlflow.end_run()
             except:
                 pass
-    
+        
     def run_complete_pipeline(self):
         """Run the complete training pipeline"""
         logger.info("Starting complete Whisper training pipeline...")
@@ -821,7 +1086,7 @@ class WhisperTrainingPipeline:
             dataset = self.prepare_dataset(processed_samples)
             
             # 4. Evaluate baseline
-            baseline_wer = self.evaluate_baseline(processed_samples[-20:], self.config.max_eval_samples)
+            baseline_wer = self.evaluate_baseline(processed_samples[-20:])
             
             # 5. Setup trainer
             self.setup_trainer(dataset, baseline_wer)
@@ -862,45 +1127,202 @@ class WhisperTrainingPipeline:
 
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Whisper Fine-tuning Pipeline")
-    parser.add_argument("--config", type=str, help="Path to configuration file")
-    parser.add_argument("--labelstudio-export", type=str, help="Path to Label Studio export")
-    parser.add_argument("--audio-base-path", type=str, help="Base path for audio files")
-    parser.add_argument("--model-name", type=str, default="openai/whisper-small", help="Whisper model name")
-    parser.add_argument("--max-steps", type=int, default=1000, help="Maximum training steps")
-    parser.add_argument("--learning-rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--output-dir", type=str, default="./whisper-finetuned-production", help="Output directory")
+    """Main entry point - enforces config-only usage for robust experimentation"""
+    parser = argparse.ArgumentParser(
+        description="Whisper Fine-tuning Pipeline - Configuration-Driven",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Configuration-Only Mode:
+This pipeline requires ALL parameters to be specified in a JSON configuration file.
+Command-line overrides are no longer supported to ensure reproducible experiments.
+
+Example usage:
+    python whisper_training_pipeline.py --config config/training_config.json
+    
+Configuration file must contain all required parameters. See training_config.json template.
+        """
+    )
+    
+    # Only accept config file - no individual parameter overrides
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        required=True,
+        help="Path to configuration JSON file (required)"
+    )
+    
+    parser.add_argument(
+        "--validate-only", 
+        action="store_true",
+        help="Only validate configuration without running training"
+    )
+    
+    parser.add_argument(
+        "--dry-run", 
+        action="store_true",
+        help="Perform dry run: validate config, load data, but skip training"
+    )
     
     args = parser.parse_args()
     
-    # Load configuration
-    config = WhisperTrainingConfig(args.config)
+    # Validate config file exists
+    if not args.config:
+        logger.error("Configuration file is required. Use --config path/to/config.json")
+        sys.exit(1)
     
-    # Override with command line arguments
-    if args.labelstudio_export:
-        config.labelstudio_export_path = args.labelstudio_export
-    if args.audio_base_path:
-        config.audio_base_path = args.audio_base_path
-    if args.model_name:
-        config.model_name = args.model_name
-    if args.max_steps:
-        config.max_steps = args.max_steps
-    if args.learning_rate:
-        config.learning_rate = args.learning_rate
-    if args.output_dir:
-        config.output_dir = args.output_dir
+    if not os.path.exists(args.config):
+        logger.error(f"Configuration file not found: {args.config}")
+        sys.exit(1)
     
-    # Create output directory
-    os.makedirs(config.output_dir, exist_ok=True)
+    try:
+        # Load configuration (will validate all required parameters)
+        logger.info(f"Loading configuration from: {args.config}")
+        config = WhisperTrainingConfig(args.config)
+        
+        # If validation-only mode, exit after successful config validation
+        if args.validate_only:
+            logger.info("✅ Configuration validation successful!")
+            logger.info("All required parameters are present and valid.")
+            return {"status": "validation_passed", "config": config.to_dict()}
+        
+        # Create output directory
+        os.makedirs(config.output_dir, exist_ok=True)
+        logger.info(f"Output directory: {config.output_dir}")
+        
+        # Initialize pipeline
+        pipeline = WhisperTrainingPipeline(config)
+        
+        # If dry-run mode, validate data loading but don't train
+        if args.dry_run:
+            logger.info("🔄 Performing dry run...")
+            
+            # Load and validate data
+            data_loader = WhisperDataLoader(config)
+            labelstudio_data = data_loader.load_labelstudio_export()
+            processed_samples = data_loader.process_audio_samples(labelstudio_data)
+            
+            if len(processed_samples) == 0:
+                logger.error("❌ No valid audio samples found in dry run")
+                sys.exit(1)
+            
+            # Load model
+            pipeline.load_model_and_processor()
+            
+            # Prepare dataset
+            dataset = pipeline.prepare_dataset(processed_samples)
+            
+            logger.info("✅ Dry run successful!")
+            logger.info(f"Found {len(processed_samples)} valid samples")
+            logger.info(f"Dataset split - Train: {len(dataset['train'])}, Val: {len(dataset['test'])}")
+            logger.info("Configuration and data pipeline are ready for training.")
+            
+            return {
+                "status": "dry_run_passed", 
+                "samples_found": len(processed_samples),
+                "train_samples": len(dataset['train']),
+                "val_samples": len(dataset['test'])
+            }
+        
+        # Run full training pipeline
+        logger.info("🚀 Starting full training pipeline...")
+        results = pipeline.run_complete_pipeline()
+        
+        logger.info("✅ Training pipeline completed successfully!")
+        return results
+        
+    except Exception as e:
+        logger.error(f"❌ Pipeline failed: {e}")
+        
+        # Log configuration details for debugging
+        if 'config' in locals():
+            logger.error("Configuration summary:")
+            logger.error(f"  Model: {config.model_name}")
+            logger.error(f"  Data: {config.labelstudio_export_path}")
+            logger.error(f"  Output: {config.output_dir}")
+        
+        raise
+
+
+def validate_config_file(config_path: str) -> bool:
+    """Standalone function to validate configuration file"""
+    try:
+        config = WhisperTrainingConfig(config_path)
+        logger.info("✅ Configuration file is valid")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Configuration validation failed: {e}")
+        return False
+
+
+def create_sample_config(output_path: str = "sample_training_config.json"):
+    """Create a sample configuration file with all required parameters"""
+    sample_config = {
+        # Required parameters
+        "labelstudio_export_path": "label-studio-export/data-v1/manifest.jsonl",
+        "audio_base_path": "label-studio-export/data-v1",
+        "model_name": "openai/whisper-small",
+        "target_language": "sw",
+        "task": "transcribe",
+        "learning_rate": 1e-5,
+        "per_device_train_batch_size": 2,
+        "per_device_eval_batch_size": 2,
+        "gradient_accumulation_steps": 2,
+        "max_steps": 1000,
+        "warmup_steps": 500,
+        "eval_steps": 100,
+        "save_steps": 100,
+        "logging_steps": 25,
+        "fp16": False,
+        "bf16": True,
+        "gradient_checkpointing": True,
+        "dataloader_pin_memory": False,
+        "dataloader_num_workers": 0,
+        "test_size": 0.2,
+        "max_eval_samples": 10,
+        "mlflow_tracking_uri": "http://localhost:5000",
+        "mlflow_experiment_name": "whisper-production-training",
+        "output_dir": "./whisper-finetuned-production",
+        "registered_model_name": "whisper-finetuned-swahili",
+        
+        # Optional parameters with defaults
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "max_grad_norm": 1.0,
+        "optim": "adamw_torch",
+        "early_stopping_patience": 3,
+        "early_stopping_threshold": 0.01,
+        "generation_max_length": 225,
+        "target_sample_rate": 16000,
+        "min_audio_duration": 0.1,
+        "max_audio_duration": 60.0,
+        "min_transcription_length": 3,
+        "max_transcription_length": 1000
+    }
     
-    # Run pipeline
-    pipeline = WhisperTrainingPipeline(config)
-    results = pipeline.run_complete_pipeline()
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(sample_config, f, indent=2)
     
-    logger.info("Pipeline completed successfully!")
-    return results
+    logger.info(f"Sample configuration created: {output_path}")
+    return output_path
 
 
 if __name__ == "__main__":
-    main()
+    # Add option to create sample config
+    if len(sys.argv) > 1 and sys.argv[1] == "--create-sample-config":
+        output_file = sys.argv[2] if len(sys.argv) > 2 else "sample_training_config.json"
+        create_sample_config(output_file)
+        sys.exit(0)
+    
+    # Add option to validate config only
+    if len(sys.argv) > 2 and sys.argv[1] == "--validate-config":
+        config_file = sys.argv[2]
+        is_valid = validate_config_file(config_file)
+        sys.exit(0 if is_valid else 1)
+    
+    # Run the main training pipeline
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Pipeline execution failed: {e}")
+        sys.exit(1)
+# if __name__ == "__main__":
+#     main()

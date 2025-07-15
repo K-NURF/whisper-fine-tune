@@ -5,3 +5,5 @@ mlruns/
 whisper-finetuned-production/
 mlartifacts/
 logs/
+mlflow.db
+training_progress.log

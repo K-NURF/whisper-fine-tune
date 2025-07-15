@@ -1,7 +1,9 @@
 {
-  "labelstudio_export_path": "label-studio-export/data-v1/manifest.jsonl",
-  "audio_base_path": "label-studio-export/data-v1",
-  "model_name": "openai/whisper-small",
+  "_comment": "Whisper Training Configuration - Flat structure for compatibility",
+  
+  "labelstudio_export_path": "label-studio-export/asr-dataset-v1-2025-07-14/manifest.jsonl",
+  "audio_base_path": "label-studio-export/asr-dataset-v1-2025-07-14",
+  "model_name": "openai/whisper-medium",
   "target_language": "sw",
   "task": "transcribe",
   "learning_rate": 1e-05,
@@ -28,5 +30,13 @@
   "output_dir": "./whisper-finetuned-production",
   "registered_model_name": "whisper-finetuned-swahili",
   "max_grad_norm": 1.0,
-  "optim": "adamw_torch"
+  "optim": "adamw_torch",
+  "early_stopping_patience": 3,
+  "early_stopping_threshold": 0.01,
+  "generation_max_length": 225,
+  "target_sample_rate": 16000,
+  "min_audio_duration": 0.1,
+  "max_audio_duration": 60.0,
+  "min_transcription_length": 3,
+  "max_transcription_length": 1000
 }
